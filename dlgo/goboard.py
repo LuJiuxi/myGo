@@ -1,82 +1,48 @@
-# -*- coding: utf-8 -*-
-# @Time    : 2023/1/7 下午4:03
-# @Author  : Jiuxi
-# @File    : goboard.py
-# @Software: PyCharm
-# @Comment :
-
 import copy
 from dlgo.gotypes import Player, Point
+from dlgo.scoring import compute_game_result
+# tag::import_zobrist[]
 from dlgo import zobrist
+# end::import_zobrist[]
+
+__all__ = [
+    'Board',
+    'GameState',
+    'Move',
+]
 
 
-class Move:
-    """
-    动作：
-    - 落子 play
-    - 跳过 pass
-    - 认输 resign
-    """
-
-    def __init__(self, point=None, is_pass=False, is_resign=False):
-        assert (point is not None) ^ is_pass ^ is_resign  # 至少采取落子、跳过、认输的任意一个动作
-        self.point = point
-        self.is_play = (point is not None)
-        self.is_pass = is_pass
-        self.is_resign = is_resign
-
-    @classmethod
-    def play(cls, point):
-        return Move(point=point)
-
-    @classmethod
-    def pass_turn(cls):
-        return Move(is_pass=True)
-
-    @classmethod
-    def resign(cls):
-        return Move(is_resign=True)
+class IllegalMoveError(Exception):
+    pass
 
 
+# tag::fast_go_strings[]
 class GoString:
-    """
-    棋链: 颜色相同且连续的棋子构成的集合
-    """
-
     def __init__(self, color, stones, liberties):
-        """
-        :param color: 颜色
-        :param stones: 棋子 Point List
-        :param liberties: 气 Point List
-        """
-
         self.color = color
         self.stones = frozenset(stones)
-        self.liberties = frozenset(liberties)
+        self.liberties = frozenset(liberties)  # <1>
 
-    # def remove_liberty(self, point):
-    #     self.liberties.remove(point)
-
-    def without_liberty(self, point):
-        new_liberties = self.liberties - {point}
+    def without_liberty(self, point):  # <2>
+        new_liberties = self.liberties - set([point])
         return GoString(self.color, self.stones, new_liberties)
-
-    # def add_liberty(self, point):
-    #     self.liberties.add(point)
 
     def with_liberty(self, point):
-        new_liberties = self.liberties | {point}
+        new_liberties = self.liberties | set([point])
         return GoString(self.color, self.stones, new_liberties)
+# <1> `stones` and `liberties` are now immutable `frozenset` instances
+# <2> The `without_liberty` methods replaces the previous `remove_liberty` method...
+# <3> ... and `with_liberty` replaces `add_liberty`.
+# end::fast_go_strings[]
 
-    def merge_with(self, go_string):
-        """
-        合并两条棋链，返回一条新的棋链
-        当一次落子将两个棋子连起来时需要调用此方法
-        """
-        assert go_string.color == self.color
-        combined_stones = self.stones | go_string.stones
-        combined_liberties = self.liberties | go_string.liberties - combined_stones
-        return GoString(self.color, combined_stones, combined_liberties)
+    def merged_with(self, string):
+        """Return a new string containing all stones in both strings."""
+        assert string.color == self.color
+        combined_stones = self.stones | string.stones
+        return GoString(
+            self.color,
+            combined_stones,
+            (self.liberties | string.liberties) - combined_stones)
 
     @property
     def num_liberties(self):
@@ -88,27 +54,25 @@ class GoString:
             self.stones == other.stones and \
             self.liberties == other.liberties
 
+    def __deepcopy__(self, memodict={}):
+        return GoString(self.color, self.stones, copy.deepcopy(self.liberties))
 
+
+# tag::init_zobrist[]
 class Board:
-    """
-    棋盘
-    """
-
     def __init__(self, num_rows, num_cols):
         self.num_rows = num_rows
         self.num_cols = num_cols
-        self._grid = {}  # 存储棋链的字典 key: Point value: GoString
+        self._grid = {}
         self._hash = zobrist.EMPTY_BOARD
+# end::init_zobrist[]
 
     def place_stone(self, player, point):
-        """
-        处理落子的相关动作，包括
-        - 创建合并棋链
-        - 更新气数
-        - 提子
-        """
         assert self.is_on_grid(point)
+        if self._grid.get(point) is not None:
+            print('Illegal play on %s' % str(point))
         assert self._grid.get(point) is None
+        # 0. Examine the adjacent points.
         adjacent_same_color = []
         adjacent_opposite_color = []
         liberties = []
@@ -125,35 +89,60 @@ class Board:
                 if neighbor_string not in adjacent_opposite_color:
                     adjacent_opposite_color.append(neighbor_string)
         new_string = GoString(player, [point], liberties)
-        # 合并颜色相同的相邻棋链
-        for same_color_string in adjacent_same_color:
-            new_string = new_string.merge_with(same_color_string)
-        # 更新字典
-        for new_stone_point in new_string.stones:
-            self._grid[new_stone_point] = new_string
+# tag::apply_zobrist[]
+        new_string = GoString(player, [point], liberties)  # <1>
 
-        # 更新棋盘的hash
-        self._hash ^= zobrist.HASH_CODE[point, player]
+        for same_color_string in adjacent_same_color:  # <2>
+            new_string = new_string.merged_with(same_color_string)
+        for new_string_point in new_string.stones:
+            self._grid[new_string_point] = new_string
 
-        # 减少对方相邻棋链的气, 提走气尽的棋链
+        self._hash ^= zobrist.HASH_CODE[point, player]  # <3>
+
         for other_color_string in adjacent_opposite_color:
-            replacement = other_color_string.without_liberty(point)
+            replacement = other_color_string.without_liberty(point)  # <4>
             if replacement.num_liberties:
-                self._replace_string(replacement)
+                self._replace_string(other_color_string.without_liberty(point))
             else:
-                self._remove_string(other_color_string)
+                self._remove_string(other_color_string)  # <5>
+# <1> Until this line `place_stone` remains the same.
+# <2> You merge any adjacent strings of the same color.
+# <3> Next, you apply the hash code for this point and player
+# <4> Then you reduce liberties of any adjacent strings of the opposite color.
+# <5> If any opposite color strings now have zero liberties, remove them.
+# end::apply_zobrist[]
+
+
+# tag::unapply_zobrist[]
+    def _replace_string(self, new_string):  # <1>
+        for point in new_string.stones:
+            self._grid[point] = new_string
+
+    def _remove_string(self, string):
+        for point in string.stones:
+            for neighbor in point.neighbors():  # <2>
+                neighbor_string = self._grid.get(neighbor)
+                if neighbor_string is None:
+                    continue
+                if neighbor_string is not string:
+                    self._replace_string(neighbor_string.with_liberty(point))
+            self._grid[point] = None
+
+            self._hash ^= zobrist.HASH_CODE[point, string.color]  # <3>
+# <1> This new helper method updates our Go board grid.
+# <2> Removing a string can create liberties for other strings.
+# <3> With Zobrist hashing, you need to unapply the hash for this move.
+# end::unapply_zobrist[]
 
     def is_on_grid(self, point):
-        """
-        判断Point是否在棋盘上
-        """
-
         return 1 <= point.row <= self.num_rows and \
             1 <= point.col <= self.num_cols
 
     def get(self, point):
-        """
-        返回交叉点的内容，如果已经落子返回Player，否则返回None
+        """Return the content of a point on the board.
+
+        Returns None if the point is empty, or a Player if there is a
+        stone on that point.
         """
         string = self._grid.get(point)
         if string is None:
@@ -161,84 +150,86 @@ class Board:
         return string.color
 
     def get_go_string(self, point):
-        """
-        获取Point所在棋链
-        """
+        """Return the entire string of stones at a point.
 
+        Returns None if the point is empty, or a GoString if there is
+        a stone on that point.
+        """
         string = self._grid.get(point)
         if string is None:
             return None
         return string
 
-    def _replace_string(self, new_string):
-        """
-        更新棋盘网络
-        :param new_string:
-        :return: None
-        """
-        for point in new_string.stones:
-            self._grid[point] = new_string
+    def __eq__(self, other):
+        return isinstance(other, Board) and \
+            self.num_rows == other.num_rows and \
+            self.num_cols == other.num_cols and \
+            self._hash() == other._hash()
 
-    def _remove_string(self, string):
-        """
-        移除棋链即提子
-        """
-        # 一个一个的提走棋子
-        for point in string.stones:
-            # 为相邻的棋链增加气数
-            for neighbor in point.neighbors():
-                neighbor_string = self._grid.get(neighbor)
-                if neighbor_string is None:
-                    continue
-                if neighbor_string is not string:  # 保证不是自己
-                    self._replace_string(neighbor_string.with_liberty(point))
-            self._grid[point] = None
-            # 逆用hash来提子
-            self._hash ^= zobrist.HASH_CODE[point, string.color]
+    def __deepcopy__(self, memodict={}):
+        copied = Board(self.num_rows, self.num_cols)
+        # Can do a shallow copy b/c the dictionary maps tuples
+        # (immutable) to GoStrings (also immutable)
+        copied._grid = copy.copy(self._grid)
+        copied._hash = self._hash
+        return copied
 
+# tag::return_zobrist[]
     def zobrist_hash(self):
-        """
-        返回当前棋盘的hash
-        :return: int
-        """
         return self._hash
+# end::return_zobrist[]
 
 
+class Move:
+    """Any action a player can play on a turn.
+    Exactly one of is_play, is_pass, is_resign will be set.
+    """
+    def __init__(self, point=None, is_pass=False, is_resign=False):
+        assert (point is not None) ^ is_pass ^ is_resign
+        self.point = point
+        self.is_play = (self.point is not None)
+        self.is_pass = is_pass
+        self.is_resign = is_resign
+
+    @classmethod
+    def play(cls, point):
+        """A move that places a stone on the board."""
+        return Move(point=point)
+
+    @classmethod
+    def pass_turn(cls):
+        return Move(is_pass=True)
+
+    @classmethod
+    def resign(cls):
+        return Move(is_resign=True)
+
+    def __str__(self):
+        if self.is_pass:
+            return 'pass'
+        if self.is_resign:
+            return 'resign'
+        return '(r %d, c %d)' % (self.point.row, self.point.col)
+
+
+# tag::init_state_zobrist[]
 class GameState:
-    """
-    跟踪游戏状态，最终形成一个动作序列
-    """
-
     def __init__(self, board, next_player, previous, move):
-        """
-        :param board: Board
-        :param next_player: Player 下一位下棋的人
-        :param previous: GameState 上一轮的游戏状态
-        :param move: Move 上一步动作
-        """
-
         self.board = board
         self.next_player = next_player
         self.previous_state = previous
-        # 添加新的成员previous_states来记录过去所有的状态
         if self.previous_state is None:
             self.previous_states = frozenset()
         else:
             self.previous_states = frozenset(
                 previous.previous_states |
-                {(previous.next_player, previous.board.zobrist_hash())}
-            )
+                {(previous.next_player, previous.board.zobrist_hash())})
         self.last_move = move
+# end::init_state_zobrist[]
 
     def apply_move(self, move):
-        """
-        添加新的动作，返回新的状态
-        :param move: Move
-        :return GameState
-        """
-
+        """Return the new GameState after applying the move."""
         if move.is_play:
-            # 深拷贝，保存每一步的棋盘状态，这也是为什么叫goboard_slow的原因，但是实现比较简单
             next_board = copy.deepcopy(self.board)
             next_board.place_stone(self.next_player, move.point)
         else:
@@ -247,84 +238,52 @@ class GameState:
 
     @classmethod
     def new_game(cls, board_size):
-        """
-        创建新游戏
-        :param board_size: int or tuple 棋盘大小
-        :return GameState
-        """
-
         if isinstance(board_size, int):
             board_size = (board_size, board_size)
         board = Board(*board_size)
         return GameState(board, Player.black, None, None)
 
-    def is_over(self):
-        """
-        判断游戏结束
-        :return: bool
-        """
-
-        if self.last_move is None:
-            return False
-        if self.last_move.is_resign:
-            return True
-        # 判断倒数第二手
-        second_last_move = self.previous_state.last_move
-        if second_last_move is None:
-            return False
-        # 双方都选择停一手时游戏结束
-        return self.last_move.is_pass and second_last_move.is_pass
-
     def is_move_self_capture(self, player, move):
-        """
-        检查自吃
-        :param player: Player
-        :param move: Move
-        :return: bool
-        """
-
         if not move.is_play:
             return False
         next_board = copy.deepcopy(self.board)
         next_board.place_stone(player, move.point)
         new_string = next_board.get_go_string(move.point)
-        # 如果新的棋链的气为0，则发生了自吃
         return new_string.num_liberties == 0
 
     @property
     def situation(self):
-        return self.next_player, self.board
+        return (self.next_player, self.board)
 
+# tag::ko_zobrist[]
     def does_move_violate_ko(self, player, move):
-        """
-        检查是否违反劫争规则
-        :param player: Player
-        :param move: Move
-        :return: bool
-        """
-
         if not move.is_play:
             return False
         next_board = copy.deepcopy(self.board)
         next_board.place_stone(player, move.point)
         next_situation = (player.other, next_board.zobrist_hash())
         return next_situation in self.previous_states
+# end::ko_zobrist[]
 
     def is_valid_move(self, move):
-        """
-        检查动作的合法性
-        :param move: Move
-        :return: bool
-        """
-
         if self.is_over():
             return False
         if move.is_pass or move.is_resign:
             return True
         return (
-                self.board.get(move.point) is None and
-                not self.is_move_self_capture(self.next_player, move) and
-                not self.does_move_violate_ko(self.next_player, move))
+            self.board.get(move.point) is None and
+            not self.is_move_self_capture(self.next_player, move) and
+            not self.does_move_violate_ko(self.next_player, move))
+
+    def is_over(self):
+        if self.last_move is None:
+            return False
+        if self.last_move.is_resign:
+            return True
+        second_last_move = self.previous_state.last_move
+        if second_last_move is None:
+            return False
+        return self.last_move.is_pass and second_last_move.is_pass
 
     def legal_moves(self):
         moves = []

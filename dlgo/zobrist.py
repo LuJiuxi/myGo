@@ -1,9 +1,5 @@
 from dlgo.gotypes import Player, Point
 
-"""
-用hash值编码棋子
-"""
-
 __all__ = ['HASH_CODE', 'EMPTY_BOARD']
 
 HASH_CODE = {

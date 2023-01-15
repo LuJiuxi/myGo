@@ -9,7 +9,7 @@ def is_point_an_eye(board, point, color):
     if board.get(point) is not None:
         return False
     # All adjacent points must contain friendly stones.
-    for neighbor in point.neighbors():
+    for neighbor in board.neighbors(point):
         neighbor_color = board.get(neighbor)
         if neighbor_color != color:
             return False
