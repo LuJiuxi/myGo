@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 # @Time    : 2023/1/7 下午4:03
 # @Author  : Jiuxi
-# @File    : goboard_slow.py
-# @Software: PyCharm 
+# @File    : goboard.py
+# @Software: PyCharm
 # @Comment :
 
 import copy
-from dlgo.gotypes import Player
+from dlgo.gotypes import Player, Point
+from dlgo import zobrist
 
 
 class Move:
@@ -50,14 +51,22 @@ class GoString:
         """
 
         self.color = color
-        self.stones = set(stones)
-        self.liberties = set(liberties)
+        self.stones = frozenset(stones)
+        self.liberties = frozenset(liberties)
 
-    def remove_liberty(self, point):
-        self.liberties.remove(point)
+    # def remove_liberty(self, point):
+    #     self.liberties.remove(point)
 
-    def add_liberty(self, point):
-        self.liberties.add(point)
+    def without_liberty(self, point):
+        new_liberties = self.liberties - {point}
+        return GoString(self.color, self.stones, new_liberties)
+
+    # def add_liberty(self, point):
+    #     self.liberties.add(point)
+
+    def with_liberty(self, point):
+        new_liberties = self.liberties | {point}
+        return GoString(self.color, self.stones, new_liberties)
 
     def merge_with(self, go_string):
         """
@@ -89,6 +98,7 @@ class Board:
         self.num_rows = num_rows
         self.num_cols = num_cols
         self._grid = {}  # 存储棋链的字典 key: Point value: GoString
+        self._hash = zobrist.EMPTY_BOARD
 
     def place_stone(self, player, point):
         """
@@ -121,12 +131,16 @@ class Board:
         # 更新字典
         for new_stone_point in new_string.stones:
             self._grid[new_stone_point] = new_string
-        # 减少对方相邻棋链的气
+
+        # 更新棋盘的hash
+        self._hash ^= zobrist.HASH_CODE[point, player]
+
+        # 减少对方相邻棋链的气, 提走气尽的棋链
         for other_color_string in adjacent_opposite_color:
-            other_color_string.remove_liberty(point)
-        # 提走气尽的棋链
-        for other_color_string in adjacent_opposite_color:
-            if other_color_string.num_liberties == 0:
+            replacement = other_color_string.without_liberty(point)
+            if replacement.num_liberties:
+                self._replace_string(replacement)
+            else:
                 self._remove_string(other_color_string)
 
     def is_on_grid(self, point):
@@ -156,11 +170,19 @@ class Board:
             return None
         return string
 
+    def _replace_string(self, new_string):
+        """
+        更新棋盘网络
+        :param new_string:
+        :return: None
+        """
+        for point in new_string.stones:
+            self._grid[point] = new_string
+
     def _remove_string(self, string):
         """
         移除棋链即提子
         """
-
         # 一个一个的提走棋子
         for point in string.stones:
             # 为相邻的棋链增加气数
@@ -169,8 +191,17 @@ class Board:
                 if neighbor_string is None:
                     continue
                 if neighbor_string is not string:  # 保证不是自己
-                    neighbor_string.add_liberty(point)
+                    self._replace_string(neighbor_string.with_liberty(point))
             self._grid[point] = None
+            # 逆用hash来提子
+            self._hash ^= zobrist.HASH_CODE[point, string.color]
+
+    def zobrist_hash(self):
+        """
+        返回当前棋盘的hash
+        :return: int
+        """
+        return self._hash
 
 
 class GameState:
@@ -189,6 +220,14 @@ class GameState:
         self.board = board
         self.next_player = next_player
         self.previous_state = previous
+        # 添加新的成员previous_states来记录过去所有的状态
+        if self.previous_state is None:
+            self.previous_states = frozenset()
+        else:
+            self.previous_states = frozenset(
+                previous.previous_states |
+                {(previous.next_player, previous.board.zobrist_hash())}
+            )
         self.last_move = move
 
     def apply_move(self, move):
@@ -268,13 +307,8 @@ class GameState:
             return False
         next_board = copy.deepcopy(self.board)
         next_board.place_stone(player, move.point)
-        next_situation = (player.other, next_board)
-        past_state = self.previous_state
-        while past_state is not None:
-            if past_state.situation == next_situation:
-                return True
-            past_state = past_state.previous_state
-        return False
+        next_situation = (player.other, next_board.zobrist_hash())
+        return next_situation in self.previous_states
 
     def is_valid_move(self, move):
         """
@@ -291,3 +325,24 @@ class GameState:
                 self.board.get(move.point) is None and
                 not self.is_move_self_capture(self.next_player, move) and
                 not self.does_move_violate_ko(self.next_player, move))
+
+    def legal_moves(self):
+        moves = []
+        for row in range(1, self.board.num_rows + 1):
+            for col in range(1, self.board.num_cols + 1):
+                move = Move.play(Point(row, col))
+                if self.is_valid_move(move):
+                    moves.append(move)
+        # These two moves are always legal.
+        moves.append(Move.pass_turn())
+        moves.append(Move.resign())
+
+        return moves
+
+    def winner(self):
+        if not self.is_over():
+            return None
+        if self.last_move.is_resign:
+            return self.next_player
+        game_result = compute_game_result(self)
+        return game_result.winner
